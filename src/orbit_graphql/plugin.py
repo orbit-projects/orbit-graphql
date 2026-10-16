@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import re
 from collections.abc import Mapping
 from typing import Any, cast
 
@@ -31,12 +32,12 @@ from graphql import (
     parse,
     validate,
 )
-from graphql.language import SelectionSetNode
+from graphql.language import FieldNode, SelectionSetNode
 from graphql.validation import NoSchemaIntrospectionCustomRule, specified_rules
 from orbit.application import Application
 from orbit.asgi import Headers, Request, Response
 from orbit.asgi.request import HTTPError
-from orbit.plugins import Plugin
+from orbit.plugins import ControlAction, ControlResult, Plugin
 from orbit.plugins.metadata import PluginMetadata
 from pydantic import BaseModel, ConfigDict, Field, StrictStr, ValidationError
 
@@ -46,9 +47,12 @@ MAX_GRAPHQL_VARIABLE_VALUES = 10_000
 MAX_GRAPHQL_DEPTH = 32
 MAX_GRAPHQL_TOKENS = 5_000
 MAX_GRAPHQL_ERRORS = 25
+MAX_GRAPHQL_FIELDS = 500
+MAX_GRAPHQL_CONCURRENCY = 1_024
 MAX_GRAPHQL_TIMEOUT_SECONDS = 30.0
 MAX_GRAPHQL_RESPONSE_BYTES = 1_048_576
 _MAX_JSON_DEPTH = 64
+_JSON_MEDIA_TYPE = re.compile(r"application/[!#$%&'*+.^_`|~0-9a-z-]+\Z")
 
 
 class _GraphQLRequest(BaseModel):
@@ -110,8 +114,8 @@ def _validate_json_values(value: object, *, depth: int = 0, count: list[int] | N
         raise ValueError("GraphQL variables contain an invalid value.")
 
 
-def _depth_validation_rule(max_depth: int) -> type[ASTValidationRule]:
-    """Create a validator that bounds nested selection sets for one plugin configuration."""
+def _bounded_validation_rule(max_depth: int, max_fields: int) -> type[ASTValidationRule]:
+    """Bound selection nesting and total field executions across one parsed document."""
 
     class SelectionDepthRule(ASTValidationRule):
         """Reject operations and fragments whose nested selection structure is too deep."""
@@ -119,6 +123,17 @@ def _depth_validation_rule(max_depth: int) -> type[ASTValidationRule]:
         def __init__(self, context: Any) -> None:
             super().__init__(context)
             self._depth = 0
+            self._fields = 0
+            self._field_limit_reported = False
+
+        def enter_field(self, node: FieldNode, *_args: object) -> None:
+            """Reject documents whose field count can fan out excessive resolver work."""
+            self._fields += 1
+            if self._fields > max_fields and not self._field_limit_reported:
+                self._field_limit_reported = True
+                self.context.report_error(
+                    GraphQLError("GraphQL field count exceeds the configured limit.", node)
+                )
 
         def enter_selection_set(self, node: SelectionSetNode, *_args: object) -> None:
             """Count nested field selection sets during AST validation."""
@@ -160,6 +175,8 @@ class GraphQLPlugin(Plugin):
         max_query_characters: int = MAX_GRAPHQL_QUERY_CHARACTERS,
         max_tokens: int = MAX_GRAPHQL_TOKENS,
         max_depth: int = MAX_GRAPHQL_DEPTH,
+        max_fields: int = MAX_GRAPHQL_FIELDS,
+        max_concurrent_requests: int = 64,
         max_errors: int = MAX_GRAPHQL_ERRORS,
         execution_timeout: float = 5.0,
         max_response_bytes: int = MAX_GRAPHQL_RESPONSE_BYTES,
@@ -184,6 +201,10 @@ class GraphQLPlugin(Plugin):
         )
         self._max_tokens = self._bounded_int("max_tokens", max_tokens, 1, MAX_GRAPHQL_TOKENS)
         self._max_depth = self._bounded_int("max_depth", max_depth, 1, MAX_GRAPHQL_DEPTH)
+        self._max_fields = self._bounded_int("max_fields", max_fields, 1, 5_000)
+        self._max_concurrent_requests = self._bounded_int(
+            "max_concurrent_requests", max_concurrent_requests, 1, MAX_GRAPHQL_CONCURRENCY
+        )
         self._max_errors = self._bounded_int("max_errors", max_errors, 1, MAX_GRAPHQL_ERRORS)
         self._max_response_bytes = self._bounded_int(
             "max_response_bytes", max_response_bytes, 128, MAX_GRAPHQL_RESPONSE_BYTES
@@ -202,7 +223,16 @@ class GraphQLPlugin(Plugin):
         self.roles = frozenset(roles)
         self.allow_introspection = allow_introspection
         self.execution_timeout = float(execution_timeout)
-        self._depth_rule = _depth_validation_rule(self._max_depth)
+        self._depth_rule = _bounded_validation_rule(self._max_depth, self._max_fields)
+        self._execution_slots = asyncio.Semaphore(self._max_concurrent_requests)
+        self.control_actions = (
+            ControlAction(
+                id="review-policy",
+                title="Review GraphQL policy",
+                description="Inspect the endpoint path and bounded execution/security settings.",
+                handler=self._review_policy,
+            ),
+        )
 
     @staticmethod
     def _bounded_int(name: str, value: int, minimum: int, maximum: int) -> int:
@@ -224,10 +254,37 @@ class GraphQLPlugin(Plugin):
             """Execute one bounded GraphQL request and return a sanitized JSON result."""
             return await self.handle(request)
 
+    async def _review_policy(self, _: Mapping[str, object]) -> ControlResult:
+        """Present non-secret endpoint policy without executing a query or exposing schema data."""
+        return ControlResult(
+            "GraphQL endpoint policy is configured.",
+            (
+                f"path: {self.path}",
+                f"required_roles: {', '.join(sorted(self.roles)) or 'none'}",
+                f"introspection_enabled: {str(self.allow_introspection).lower()}",
+                f"max_query_characters: {self._max_query_characters}",
+                f"max_tokens: {self._max_tokens}",
+                f"max_depth: {self._max_depth}",
+                f"max_fields: {self._max_fields}",
+                f"execution_timeout_seconds: {self.execution_timeout:g}",
+            ),
+        )
+
     async def handle(self, request: Request) -> Response:
         """Execute a typed request while preserving Core auth, DI and cancellation behavior."""
         if len(request.body) > self._max_request_bytes:
             raise HTTPError(413, "graphql.request-too-large", "GraphQL request is too large.")
+        if self._execution_slots.locked():
+            return Response(
+                status=503,
+                body=b'{"errors":[{"message":"GraphQL service is at capacity."}]}',
+                headers={"content-type": "application/json"},
+            )
+        async with self._execution_slots:
+            return await self._handle_admitted(request)
+
+    async def _handle_admitted(self, request: Request) -> Response:
+        """Parse, validate, and execute a request while holding one local capacity slot."""
         values = self._decode_request(request)
         try:
             query = values.query
@@ -271,7 +328,9 @@ class GraphQLPlugin(Plugin):
         if len(content_types) != 1:
             raise HTTPError(400, "graphql.content-type", "One JSON Content-Type is required.")
         media = content_types[0].partition(";")[0].strip().lower()
-        if media != "application/json" and not media.endswith("+json"):
+        if media != "application/json" and not (
+            _JSON_MEDIA_TYPE.fullmatch(media) is not None and media.endswith("+json")
+        ):
             raise HTTPError(415, "graphql.media-type", "A JSON request body is required.")
         try:
             decoded = json.loads(
@@ -324,6 +383,8 @@ __all__ = [
     "GraphQLPlugin",
     "MAX_GRAPHQL_DEPTH",
     "MAX_GRAPHQL_ERRORS",
+    "MAX_GRAPHQL_CONCURRENCY",
+    "MAX_GRAPHQL_FIELDS",
     "MAX_GRAPHQL_QUERY_CHARACTERS",
     "MAX_GRAPHQL_REQUEST_BYTES",
     "MAX_GRAPHQL_RESPONSE_BYTES",

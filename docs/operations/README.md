@@ -1,76 +1,46 @@
-# Orbit GraphQL: operations and security
+# Orbit GraphQL operations
 
-This guide organizes runtime behavior documented by the package. It does not certify production readiness. Verify provider/client versions, permissions, transport security, limits, and failure behavior in the target environment before release.
+Register the plugin and schema explicitly during application composition. Core owns the ASGI
+listener and body buffering; `orbit-graphql` contributes a POST endpoint and per-instance execution
+limits. Set Core's `ApplicationConfig.max_body_bytes` no higher than the plugin's configured
+`max_request_bytes` so Core does not buffer a larger request before GraphQL rejects it.
 
-## Configuration surface
+## Admission and query budgets
 
-Environment names found in the package README:
+The defaults cap request bytes at 256 KiB, query length at 128 Ki characters, parser tokens at
+5,000, document fields at 500, selection depth at 32, validation errors at 25, variables at 10,000
+JSON values and 64 levels, active request handling at 64 concurrent requests, execution at five
+seconds, and serialized response bytes at 1 MiB. Settings may be lowered; constructor hard maxima
+are exported or enforced by the package.
 
-The package README does not name `ORBIT_*` variables. Use its typed constructors and application configuration, and confirm exact runtime inputs in the implementation before deployment.
+Field count and depth are shape limits, not a full query-cost model. A resolver that returns an
+unbounded collection or makes many database/API calls can still consume substantial resources with
+a small query. Enforce page sizes, rows, resolver timeouts, downstream quotas, and field-level
+authorization in the schema/application. Add per-client rate limits at the application/security
+layer and size downstream pools for total service capacity.
 
-Use the package README's constructor and deployment examples. Store credentials in a secret manager and avoid logging credentials, raw provider errors, request data, or opaque cursors.
+The 64-request admission default is per plugin instance. Requests arriving while all slots are
+occupied receive HTTP 503 immediately; they are not placed into an unbounded waiting queue. A
+separate instance in each process has its own slots. Calculate total possible resolver concurrency
+across worker and replica counts. Tune the limit against the database pool, downstream quotas, and
+measured latency. There is no automatic retry for rejected or failed requests.
 
-## Lifecycle, failure behavior, and limits
+## Execution, response, and cancellation
 
-`orbit-graphql` adds an optional GraphQL HTTP endpoint to an Orbit application through Core's
-native plugin, router, authentication, request, and response contracts. It uses `graphql-core` as
-the GraphQL specification parser, validator, and execution engine; it does not add another ASGI
-server or web framework. See the [GraphQL-core documentation](https://graphql-core-3.readthedocs.io/en/stable/).
+Execution defaults to a five-second deadline. Timeout cancels async resolver awaits and returns a
+sanitized GraphQL error. It cannot stop synchronous resolver code that blocks the event loop, and a
+timed-out mutation may have completed a side effect. Keep resolvers nonblocking and mutations
+idempotent where retries are possible.
 
-## Install and configure
+The response serializer emits compact JSON and replaces resolver error text with generic messages.
+If a response exceeds the cap, the result becomes a compact `Response too large` GraphQL error.
+Correlate failures with Core request diagnostics and application-owned structured logs; do not log
+raw query variables or credentials by default.
 
-```bash
-python -m pip install orbit-core orbit-graphql
-```
+## Deployment checks
 
-Register a schema explicitly. Resolvers receive the Orbit `Request` in `info.context`, so they can
-use request-scoped dependencies and the authenticated principal without a second HTTP runtime.
-
-```python
-from graphql import GraphQLField, GraphQLObjectType, GraphQLSchema, GraphQLString
-from orbit import Application, ApplicationConfig
-from orbit_graphql import GraphQLPlugin
-
-query = GraphQLObjectType(
-    "Query",
-    {"hello": GraphQLField(GraphQLString, resolve=lambda _root, _info: "world")},
-)
-application = Application(ApplicationConfig(name="example"))
-application.register_plugin(GraphQLPlugin(GraphQLSchema(query=query)))
-```
-
-The endpoint accepts POST requests at `/graphql`. The default route requires the
-`orbit.graphql.execute` role, and schema introspection is disabled. Set `roles=()` only when the
-route is intentionally public; keep field-level authorization in resolvers for data with different
-access policies. Enable introspection explicitly for trusted development tooling when appropriate.
-
-## Request and execution limits
-
-Defaults cap the request body at 256 KiB, query text at 128 Ki characters, parser work at 5,000
-tokens, selection nesting at 32 levels, variables at 10,000 JSON values and 64 levels, validation
-errors at 25, execution time at five seconds, and response JSON at 1 MiB. The application may
-select tighter limits within the package's published maxima. Duplicate JSON keys, non-finite
-numbers, unknown request fields, invalid query documents, and non-JSON values are rejected or
-returned as bounded GraphQL errors. Core buffers an ASGI body before calling the route, so set
-Core's `ApplicationConfig.max_body_bytes` to 256 KiB or lower when using the default package limit.
-
-GraphQL operation and resolver errors are returned using generic messages so query values, schema
-details, and provider exception text are not copied into HTTP responses. Correlate failures using
-Core's request diagnostics and application-owned logging. The execution deadline cancels async
-resolvers; synchronous resolvers must remain nonblocking because Python cannot safely preempt a
-resolver that blocks the event loop. A resolver must still enforce its own row, page-size, and
-downstream-call budgets. Selection depth and parser-token limits bound query shape but do not
-replace per-client rate limits, cost analysis, database quotas, or authorization.
-
-## Scope and status
-
-GraphQL execution runs in-process in Python, which keeps resolvers beside Core's request context,
-DI, routing, lifecycle, and security. A separate TypeScript GraphQL service is a distinct variant
-only if it implements the same capability behind an explicitly configured process or HTTP boundary;
-Core does not detect or switch runtimes. This package includes no IDE, subscriptions, multipart
-uploads, file upload transport, federation, persisted-query store, or live load evidence. It is
-pre-alpha and supports Python 3.11 through 3.14.
-
-## Production validation
-
-Validate startup/shutdown cleanup, timeout and cancellation behavior, concurrency and payload bounds where applicable, secret rotation and least-privilege access, data durability, backup/restore, and failover against the selected provider. Do not infer distributed or durable guarantees from an in-process API or fake-client tests.
+Validate authentication roles, field-level access, introspection policy, body limits, query-shape
+limits, resolver pagination, concurrent request limits, cancellation, sync resolver behavior,
+mutations with ambiguous timeouts, and response-size handling. Put TLS and per-client rate limiting
+at the appropriate application/ingress layer. Local schema tests do not prove a production query
+budget or database capacity.

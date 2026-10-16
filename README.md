@@ -31,16 +31,21 @@ The endpoint accepts POST requests at `/graphql`. The default route requires the
 `orbit.graphql.execute` role, and schema introspection is disabled. Set `roles=()` only when the
 route is intentionally public; keep field-level authorization in resolvers for data with different
 access policies. Enable introspection explicitly for trusted development tooling when appropriate.
+Orbit CLI exposes a **Review GraphQL policy** action with the endpoint path, required route roles,
+introspection setting, and bounded execution limits. It does not execute queries or print schema or
+resolver data.
 
 ## Request and execution limits
 
 Defaults cap the request body at 256 KiB, query text at 128 Ki characters, parser work at 5,000
-tokens, selection nesting at 32 levels, variables at 10,000 JSON values and 64 levels, validation
-errors at 25, execution time at five seconds, and response JSON at 1 MiB. The application may
-select tighter limits within the package's published maxima. Duplicate JSON keys, non-finite
-numbers, unknown request fields, invalid query documents, and non-JSON values are rejected or
-returned as bounded GraphQL errors. Core buffers an ASGI body before calling the route, so set
-Core's `ApplicationConfig.max_body_bytes` to 256 KiB or lower when using the default package limit.
+tokens, 500 fields, selection nesting at 32 levels, variables at 10,000 JSON values and 64 levels,
+validation errors at 25, concurrent requests at 64, execution time at five seconds, and response
+JSON at 1 MiB. The application may select tighter limits within the package's published maxima.
+Duplicate JSON keys, non-finite numbers, unknown request fields, invalid query documents, and
+non-JSON values are rejected or returned as bounded GraphQL errors. Requests over the configured
+concurrency are rejected with HTTP 503 instead of waiting in an unbounded queue. Core buffers an
+ASGI body before calling the route, so set Core's `ApplicationConfig.max_body_bytes` to 256 KiB or
+lower when using the default package limit.
 
 GraphQL operation and resolver errors are returned using generic messages so query values, schema
 details, and provider exception text are not copied into HTTP responses. Correlate failures using
@@ -57,7 +62,7 @@ DI, routing, lifecycle, and security. A separate TypeScript GraphQL service is a
 only if it implements the same capability behind an explicitly configured process or HTTP boundary;
 Core does not detect or switch runtimes. This package includes no IDE, subscriptions, multipart
 uploads, file upload transport, federation, persisted-query store, or live load evidence. It is
-pre-alpha and supports Python 3.11 through 3.14.
+alpha and supports Python 3.11 through 3.14.
 
 ## Documentation
 

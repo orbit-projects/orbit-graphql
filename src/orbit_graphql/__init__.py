@@ -14,8 +14,10 @@
 """Optional GraphQL execution integration for Orbit Core."""
 
 from orbit_graphql.plugin import (
+    MAX_GRAPHQL_CONCURRENCY,
     MAX_GRAPHQL_DEPTH,
     MAX_GRAPHQL_ERRORS,
+    MAX_GRAPHQL_FIELDS,
     MAX_GRAPHQL_QUERY_CHARACTERS,
     MAX_GRAPHQL_REQUEST_BYTES,
     MAX_GRAPHQL_RESPONSE_BYTES,
@@ -27,8 +29,10 @@ from orbit_graphql.plugin import (
 
 __all__ = [
     "GraphQLPlugin",
+    "MAX_GRAPHQL_CONCURRENCY",
     "MAX_GRAPHQL_DEPTH",
     "MAX_GRAPHQL_ERRORS",
+    "MAX_GRAPHQL_FIELDS",
     "MAX_GRAPHQL_QUERY_CHARACTERS",
     "MAX_GRAPHQL_REQUEST_BYTES",
     "MAX_GRAPHQL_RESPONSE_BYTES",

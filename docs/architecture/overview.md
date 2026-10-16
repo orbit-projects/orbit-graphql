@@ -1,42 +1,58 @@
-# Orbit GraphQL: architecture and boundaries
+# Orbit GraphQL architecture
 
-## Responsibility
+`orbit-graphql` is an optional in-process GraphQL-over-HTTP endpoint implemented as a Core plugin.
+It uses `graphql-core` to parse, validate, and execute a caller-supplied `GraphQLSchema`. It
+registers a POST route through Core and passes the Core `Request` as GraphQL resolver context.
+There is no second ASGI server or web framework.
 
-`orbit-graphql` adds an optional GraphQL HTTP endpoint to an Orbit application through Core's
-native plugin, router, authentication, request, and response contracts. It uses `graphql-core` as
-the GraphQL specification parser, validator, and execution engine; it does not add another ASGI
-server or web framework. See the [GraphQL-core documentation](https://graphql-core-3.readthedocs.io/en/stable/).
+```text
+Core router/auth/DI ──> GraphQLPlugin ──> graphql-core ──> application resolvers
+       Request ───────────────────────────────────────────> info.context
+```
 
-## Declared dependencies
+Core continues to own routing, authentication, request-body reception, dependency context,
+application lifecycle, and transport errors. The plugin owns GraphQL JSON decoding, parser and
+schema validation, execution limits, safe GraphQL response formatting, and a per-plugin in-process
+admission bound. Resolvers own data access, field-level authorization, pagination, and downstream
+resource budgets.
 
-The following dependency declarations come from the checked-in manifests. Optional groups and development dependencies are called out separately.
+## Request pipeline
 
-### `pyproject.toml`
-- `graphql-core>=3.2.12,<3.3`
-- `orbit-core>=0.1.0a1,<0.2`
-- `pydantic>=2.8,<3`
-- Optional `dev` group: `pytest>=8,<10`, `pytest-asyncio>=0.24,<2`, `ruff>=0.8,<1`, `mypy>=1.13,<2`, `orbit-testing>=0.1.0a1,<0.2`.
+The endpoint accepts POST requests at the configured path (default `/graphql`). It requires an
+`application/json` or `application/*+json` media type and an object with a query plus optional
+variables and operation name. Unknown top-level fields, duplicate JSON keys, non-finite numbers,
+excessive nesting/value count, and invalid GraphQL documents are rejected. Parsing and validation
+errors do not echo query text or schema details.
 
-Declared dependencies do not mean that optional providers or services are bundled with this package.
+The route requires the `orbit.graphql.execute` role by default. Setting `roles=()` explicitly makes
+the route public; every resolver that reads protected data still needs field/resource authorization.
+Introspection is disabled by default and can be enabled explicitly for a trusted environment.
 
-## Implementation layout
+## Resource boundaries
 
-Representative implementation files in this checkout:
+Default policy caps are: 256 KiB request body, 128 Ki query characters, 5,000 parser tokens, 500
+fields across the parsed document, 32 nested selection sets, 10,000 variable values, 64 JSON
+nesting levels, 25 validation errors, 64 concurrent in-process requests, five seconds execution,
+and 1 MiB serialized response. Constructor settings can lower policy within each documented hard
+ceiling. Core buffers the ASGI body before the plugin sees it, so Core's own body limit must be set
+to at most the plugin request bound to avoid a larger upstream allocation.
 
-- `src/orbit_graphql/__init__.py`
-- `src/orbit_graphql/plugin.py`
+Requests beyond the local concurrency slots receive HTTP 503 without being queued. Slots are
+per-plugin object and per-process; deployments with multiple workers/replicas multiply aggregate
+capacity. This is not per-client rate limiting. Field count limits prevent very wide documents from
+calling unbounded resolvers, but they do not calculate query cost from aliases, schema cardinality,
+database rows, fanout, or downstream work. Resolvers must apply row/page limits, authorization,
+timeouts, and provider quotas.
 
-## Public contract and scope
+## Error and cancellation semantics
 
-## Scope and status
+Resolver failures become a generic GraphQL error; exception text and causes are not serialized.
+Async execution is wrapped in a timeout, which cancels awaiting async resolvers. Cancellation from
+the host propagates. Synchronous resolvers can block the event loop and cannot be safely preempted;
+keep them nonblocking or move blocking work behind an explicitly managed executor. A timed-out
+resolver may already have performed a side effect, so mutations need application-level
+idempotency/transaction policy.
 
-GraphQL execution runs in-process in Python, which keeps resolvers beside Core's request context,
-DI, routing, lifecycle, and security. A separate TypeScript GraphQL service is a distinct variant
-only if it implements the same capability behind an explicitly configured process or HTTP boundary;
-Core does not detect or switch runtimes. This package includes no IDE, subscriptions, multipart
-uploads, file upload transport, federation, persisted-query store, or live load evidence. It is
-pre-alpha and supports Python 3.11 through 3.14.
-
-## Boundary rules
-
-Keep provider SDKs, credentials, transports, and provider-specific error translation in provider adapters. Keep reusable capability contracts in the matching capability package and lifecycle orchestration in Core. Apply the relevant layer for this repository and preserve the dependency direction shown above.
+The plugin adds no subscriptions, uploads, persisted-query store, federation, schema registry, or
+external service. The package is alpha; local tests do not establish hosted CI or deployment
+capacity.

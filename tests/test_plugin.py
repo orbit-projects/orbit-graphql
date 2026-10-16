@@ -121,6 +121,18 @@ async def test_wrong_content_type_and_oversized_request_fail_before_execution() 
 
 
 @pytest.mark.asyncio
+async def test_only_application_json_media_types_are_accepted() -> None:
+    plugin = GraphQLPlugin(schema_for(), roles=())
+
+    status, result = await execute(
+        plugin, b'{"query":"{ greeting }"}', content_type="text/example+json"
+    )
+
+    assert status == 415
+    assert result["code"] == "graphql.media-type"
+
+
+@pytest.mark.asyncio
 async def test_default_introspection_and_excessive_selection_depth_are_denied() -> None:
     introspection = GraphQLPlugin(schema_for(), roles=())
     depth = GraphQLPlugin(schema_for(), roles=(), max_depth=1)
@@ -133,6 +145,24 @@ async def test_default_introspection_and_excessive_selection_depth_are_denied() 
     assert introspection_result["errors"]
     assert depth_result["errors"]
     assert "introspection" not in json.dumps(introspection_result).lower()
+
+
+@pytest.mark.asyncio
+async def test_field_count_limit_rejects_wide_queries_before_resolvers_run() -> None:
+    calls = 0
+
+    def resolver(*_args: object) -> str:
+        nonlocal calls
+        calls += 1
+        return "value"
+
+    query = GraphQLObjectType("Query", {"value": GraphQLField(GraphQLString, resolve=resolver)})
+    plugin = GraphQLPlugin(GraphQLSchema(query=query), roles=(), max_fields=2)
+    status, result = await execute(plugin, b'{"query":"{ first:value second:value third:value }"}')
+
+    assert status == 200
+    assert result["errors"]
+    assert calls == 0
 
 
 @pytest.mark.asyncio
@@ -181,6 +211,42 @@ async def test_execution_timeout_cancels_async_resolver() -> None:
 
 
 @pytest.mark.asyncio
+async def test_concurrent_request_limit_rejects_overload_without_waiting() -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow(*_args: object) -> str:
+        entered.set()
+        await release.wait()
+        return "done"
+
+    plugin = GraphQLPlugin(schema_for(slow), roles=(), max_concurrent_requests=1)
+    application = make_application(plugin)
+    async with TestClient(ASGIApplication(application)) as client:
+        first = asyncio.create_task(
+            client.request(
+                "POST",
+                "/graphql",
+                body=b'{"query":"{ greeting }"}',
+                headers={"content-type": "application/json"},
+            )
+        )
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        overloaded = await client.request(
+            "POST",
+            "/graphql",
+            body=b'{"query":"{ greeting }"}',
+            headers={"content-type": "application/json"},
+        )
+        release.set()
+        completed = await first
+
+    assert overloaded.status == 503
+    assert overloaded.json()["errors"][0]["message"] == "GraphQL service is at capacity."
+    assert completed.status == 200
+
+
+@pytest.mark.asyncio
 async def test_response_size_is_bounded_and_query_errors_do_not_echo_input() -> None:
     plugin = GraphQLPlugin(schema_for(lambda *_args: "x" * 300), roles=(), max_response_bytes=128)
 
@@ -192,11 +258,15 @@ async def test_response_size_is_bounded_and_query_errors_do_not_echo_input() -> 
     assert "missing" not in json.dumps(error_result)
 
 
-def test_default_role_is_required_and_configuration_limits_are_strict() -> None:
+async def test_default_role_is_required_and_configuration_limits_are_strict() -> None:
     plugin = GraphQLPlugin(schema_for())
     application = make_application(plugin)
 
     assert application.plugins.ordered()
     assert plugin.roles == frozenset({"orbit.graphql.execute"})
+    result = await plugin.control_actions[0].handler({})
+    assert result is not None
+    assert result.summary == "GraphQL endpoint policy is configured."
+    assert "introspection_enabled: false" in result.details
     with pytest.raises(ValueError, match="integer"):
         GraphQLPlugin(schema_for(), max_tokens=True)  # type: ignore[arg-type]
